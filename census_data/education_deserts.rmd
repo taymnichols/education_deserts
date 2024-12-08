@@ -1,0 +1,131 @@
+---
+title: "education_deserts"
+author: "Taylor Nichols"
+date: "2024-12-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+library(tidycensus)
+library(janitor)
+library(sf)
+```
+
+
+```{r}
+colleges <- read_csv("all_institutions.csv") |> clean_names()
+addresses <- read_csv("geocoded_addresses.csv") |> clean_names()
+value_labels <- read_csv("value_labels_all_institutions.csv") |> clean_names()
+```
+
+```{r}
+less_than_2_year <-
+  colleges |>
+  filter(iclevel_hd2023 == 3)
+```
+
+
+```{r}
+four_year_community_college <- colleges |>
+  filter(sector_hd2023 %in% c(1, 2, 3, 4)) |>
+    filter(instcat_hd2023 %in% c(1, 2, 3, 4))
+```
+
+```{r}
+public_colleges <- colleges |>
+  filter(control_hd2023 == 1)
+```
+
+```{r}
+#Get census data
+# Load population data for census tracts
+census_api_key <- Sys.getenv("CENSUS_API_KEY")
+
+# Define a list of all U.S. states (excluding territories)
+states <- c("AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", 
+            "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", 
+            "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", 
+            "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", 
+            "VT", "VA", "WA", "WV", "WI", "WY")
+
+# Initialize an empty list to store each state's data
+all_tract_population_list <- list()
+
+# Loop through each state, fetch data, and store in the list
+for (state in states) {
+  # Fetch ACS data for the state and handle any errors
+  state_data <- tryCatch({
+    get_acs(
+      geography = "tract",
+      variables = "B01001_020E", # total pop 18+
+      state = state,
+      year = 2020,
+      geometry = TRUE           # Set to TRUE to get geometry for mapping
+    )
+  }, error = function(e) {
+    message(paste("Error fetching data for state:", state))
+    return(NULL) # Skip this state if there's an error
+  })
+  
+  # Add to the list if data was successfully fetched
+  if (!is.null(state_data)) {
+    all_tract_population_list[[state]] <- state_data
+  }
+}
+
+# Bind all state data frames at once using bind_rows() on the list
+all_tract_population <- bind_rows(all_tract_population_list)
+```
+
+
+```{r}
+colleges_lat_long <- addresses |>
+  select(institution_name, unit_id, latitude, longitude)
+```
+
+```{r}
+# Convert colleges_lat_long to sf object with latitude and longitude columns
+colleges_sf <- st_as_sf(colleges_lat_long, coords = c("longitude", "latitude"), crs = 4326)
+
+# Transform to UTM (meters) for accurate distance calculations (e.g., EPSG:32633 for UTM zone 33N)
+colleges_sf <- st_transform(colleges_sf, 32633)
+
+# Create a 50-mile buffer (50 miles = 80467 meters)
+colleges_buffer <- st_buffer(colleges_sf, 80467)
+```
+
+```{r}
+# Transform census data to UTM (EPSG:32633) for accurate distance calculations
+all_tract_population <- st_transform(all_tract_population, 32633)
+```
+
+```{r}
+# Perform spatial intersection to find census tracts within the buffer zones
+population_within_buffer <- st_intersection(all_tract_population, colleges_buffer)
+
+# Calculate the area of the intersected portion (in square meters)
+population_within_buffer$intersected_area <- st_area(population_within_buffer)
+
+# Calculate the total area of each tract (in square meters)
+all_tract_population$total_area <- st_area(all_tract_population)
+
+# Use st_join to match total_area to the intersected reas
+population_within_buffer <- st_join(population_within_buffer, all_tract_population[, c("GEOID", "total_area")])
+
+# Calculate the percentage of each tract's area within the 50-mile buffer
+population_within_buffer$percent_area_within_buffer <- 
+  (population_within_buffer$intersected_area / population_within_buffer$total_area) * 100
+```
+
+```{r}
+# Calculate the population not within the 50-mile buffer
+population_within_buffer$population_not_within_buffer <- 
+  population_within_buffer$population - population_within_buffer$population_within_buffer
+```
+
